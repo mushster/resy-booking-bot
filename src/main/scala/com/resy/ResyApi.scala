@@ -90,7 +90,14 @@ object ResyApi extends Logging {
     ws.url(url)
       .withHttpHeaders(createHeaders(resyKeys): _*)
       .get
-      .map(_.body)(system.dispatcher)
+      .map { response =>
+        if (response.status >= 200 && response.status < 300) {
+          response.body
+        } else {
+          logger.warn(s"HTTP ${response.status}: ${response.body.take(200)}")
+          throw new RuntimeException(s"HTTP ${response.status}: ${response.body.take(100)}")
+        }
+      }(system.dispatcher)
   }
 
   private def sendPostRequest(
@@ -113,13 +120,23 @@ object ResyApi extends Logging {
         ): _*
       )
       .post(post)
-      .map(_.body)(system.dispatcher)
+      .map { response =>
+        if (response.status >= 200 && response.status < 300) {
+          response.body
+        } else {
+          logger.warn(s"HTTP ${response.status}: ${response.body.take(200)}")
+          throw new RuntimeException(s"HTTP ${response.status}: ${response.body.take(100)}")
+        }
+      }(system.dispatcher)
   }
 
   private[this] def createHeaders(resyKeys: ResyKeys): Seq[(String, String)] = {
     Seq(
       "Authorization"     -> s"""ResyAPI api_key="${resyKeys.apiKey}"""",
-      "x-resy-auth-token" -> resyKeys.authToken
+      "x-resy-auth-token" -> resyKeys.authToken,
+      "Origin"            -> "https://resy.com",
+      "Referer"           -> "https://resy.com/",
+      "User-Agent"        -> "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
     )
   }
 

@@ -4,13 +4,11 @@ import org.apache.logging.log4j.scala.Logging
 import org.joda.time.DateTime
 import play.api.libs.json.{JsArray, JsValue, Json}
 
-import scala.annotation.tailrec
-import scala.concurrent.Await
+import scala.concurrent.{ExecutionContext, Future}
 import scala.concurrent.duration._
 import scala.language.postfixOps
-import scala.util.{Failure, Success, Try}
 
-class ResyClient(resyApi: ResyApi) extends Logging {
+class ResyClient(resyApi: ResyApi)(implicit ec: ExecutionContext) extends Logging {
 
   private type ReservationMap = Map[String, TableTypeMap]
   private type TableTypeMap   = Map[String, String]
@@ -32,7 +30,7 @@ class ResyClient(resyApi: ResyApi) extends Logging {
     * @param millisToRetry
     *   Optional parameter for how long to try to find a reservations in milliseconds
     * @return
-    *   configId which is the unique identifier for the reservation
+    *   Future containing configId which is the unique identifier for the reservation
     */
   def findReservations(
     date: String,
@@ -40,15 +38,71 @@ class ResyClient(resyApi: ResyApi) extends Logging {
     venueId: Int,
     resTimeTypes: Seq[ReservationTimeType],
     millisToRetry: Long = (10 seconds).toMillis
-  ): Try[String] =
-    retryFindReservations(
-      date,
-      partySize,
-      venueId,
-      resTimeTypes,
-      millisToRetry,
-      DateTime.now.getMillis
-    )
+  ): Future[String] = {
+    val deadline = DateTime.now.getMillis + millisToRetry
+
+    def attempt(): Future[String] = {
+      resyApi.getReservations(date, partySize, venueId).flatMap { response =>
+        logger.debug(s"URL Response: $response")
+
+        parseAndFindReservation(response, resTimeTypes) match {
+          case Right(configId) =>
+            logger.info(s"Config Id: $configId")
+            Future.successful(configId)
+          case Left(error) if DateTime.now.getMillis < deadline =>
+            logger.debug(s"Retrying find: $error")
+            attempt() // retry immediately
+          case Left(error) =>
+            logger.info("Missed the shot!")
+            logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
+            logger.info(error)
+            Future.failed(new RuntimeException(error))
+        }
+      }.recoverWith {
+        case e if DateTime.now.getMillis < deadline =>
+          logger.debug(s"Retrying after error: ${e.getMessage}")
+          attempt()
+        case e =>
+          logger.info("Missed the shot!")
+          logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
+          logger.info(s"$noAvailableResMsg: ${e.getMessage}")
+          Future.failed(new RuntimeException(noAvailableResMsg))
+      }
+    }
+
+    attempt()
+  }
+
+  /** Parse response and find matching reservation based on priority list
+    */
+  private def parseAndFindReservation(
+    response: String,
+    resTimeTypes: Seq[ReservationTimeType]
+  ): Either[String, String] = {
+    try {
+      val json = Json.parse(response)
+
+      // Validate response structure
+      val slotsOpt = (json \ "results" \ "venues" \ 0 \ "slots").asOpt[JsArray]
+
+      slotsOpt match {
+        case None =>
+          Left(s"Invalid response structure: missing slots. Response: ${response.take(200)}")
+        case Some(slots) if slots.value.isEmpty =>
+          Left("No slots available in response")
+        case Some(slots) =>
+          val reservationMap = buildReservationMap(slots.value.toSeq)
+          if (reservationMap.isEmpty) {
+            Left("Empty reservation map")
+          } else {
+            findReservationTime(reservationMap, resTimeTypes)
+          }
+      }
+    } catch {
+      case e: Exception =>
+        Left(s"Failed to parse response: ${e.getMessage}. Response: ${response.take(200)}")
+    }
+  }
 
   /** Get details of the reservation
     * @param configId
@@ -58,46 +112,42 @@ class ResyClient(resyApi: ResyApi) extends Logging {
     * @param partySize
     *   Size of the party reservation
     * @return
-    *   The paymentMethodId and the bookingToken of the reservation
+    *   Future containing the paymentMethodId and the bookingToken of the reservation
     */
-  def getReservationDetails(configId: String, date: String, partySize: Int): Try[BookingDetails] = {
-    val bookingDetailsResp = Try {
-      val response = Await.result(
-        awaitable = resyApi.getReservationDetails(configId, date, partySize),
-        atMost    = 5 seconds
-      )
-
+  def getReservationDetails(configId: String, date: String, partySize: Int): Future[BookingDetails] = {
+    resyApi.getReservationDetails(configId, date, partySize).map { response =>
       logger.debug(s"URL Response: $response")
 
       val resDetails = Json.parse(response)
 
-      // Searching this JSON structure...
-      // {"user": {"payment_methods": [{"id": 42, ...}]}}
-      val paymentMethodId =
-        (resDetails \ "user" \ "payment_methods" \ 0 \ "id").get.toString
+      // Validate and extract payment method ID
+      val paymentMethodId = (resDetails \ "user" \ "payment_methods" \ 0 \ "id")
+        .asOpt[Int]
+        .getOrElse {
+          throw new RuntimeException(
+            s"Missing payment_methods in response. Got: ${response.take(300)}"
+          )
+        }
 
       logger.info(s"Payment Method Id: $paymentMethodId")
 
-      // Searching this JSON structure...
-      // {"book_token": {"value": "BOOK_TOKEN", ...}}
-      val bookToken =
-        (resDetails \ "book_token" \ "value").get.toString
-          .drop(1)
-          .dropRight(1)
+      // Validate and extract book token
+      val bookToken = (resDetails \ "book_token" \ "value")
+        .asOpt[String]
+        .getOrElse {
+          throw new RuntimeException(
+            s"Missing book_token in response. Got: ${response.take(300)}"
+          )
+        }
 
       logger.info(s"Book Token: $bookToken")
 
-      BookingDetails(paymentMethodId.toInt, bookToken)
-    }
-
-    bookingDetailsResp match {
-      case Success(bookingDetails) =>
-        Success(bookingDetails)
-      case _ =>
-        logger.info("Missed the shot!")
-        logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
-        logger.info(unknownErrorMsg)
-        Failure(new RuntimeException(unknownErrorMsg))
+      BookingDetails(paymentMethodId, bookToken)
+    }.recoverWith { case e =>
+      logger.info("Missed the shot!")
+      logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
+      logger.info(s"$unknownErrorMsg: ${e.getMessage}")
+      Future.failed(new RuntimeException(unknownErrorMsg))
     }
   }
 
@@ -106,123 +156,88 @@ class ResyClient(resyApi: ResyApi) extends Logging {
     *   Unique identifier of the payment id in case of a late cancellation fee
     * @param bookToken
     *   Unique identifier of the reservation in question
+    * @param dryRun
+    *   If true, skip actual booking and return a fake token
     * @return
-    *   Unique identifier of the confirmed booking
+    *   Future containing unique identifier of the confirmed booking
     */
-  def bookReservation(paymentMethodId: Int, bookToken: String): Try[String] = {
-    val resyTokenResp = Try {
-      val response = Await.result(
-        awaitable = resyApi.postReservation(paymentMethodId, bookToken),
-        atMost    = 10 seconds
-      )
+  def bookReservation(paymentMethodId: Int, bookToken: String, dryRun: Boolean = false): Future[String] = {
+    if (dryRun) {
+      logger.info("[DRY-RUN] Would book reservation")
+      logger.info(s"[DRY-RUN] Payment Method Id: $paymentMethodId")
+      logger.info(s"[DRY-RUN] Book Token: $bookToken")
+      logger.info("Headshot! (dry-run)")
+      logger.info("(҂‾ ▵‾)︻デ═一 (× _ ×#")
+      Future.successful("DRY-RUN-TOKEN")
+    } else {
+      resyApi.postReservation(paymentMethodId, bookToken).map { response =>
+        logger.debug(s"URL Response: $response")
 
-      logger.debug(s"URL Response: $response")
+        val resyToken = (Json.parse(response) \ "resy_token")
+          .asOpt[String]
+          .getOrElse {
+            throw new RuntimeException(
+              s"Missing resy_token in response. Got: ${response.take(300)}"
+            )
+          }
 
-      // Searching this JSON structure...
-      // {"resy_token": "RESY_TOKEN", ...}
-      (Json.parse(response) \ "resy_token").get.toString
-        .drop(1)
-        .dropRight(1)
-    }
-
-    resyTokenResp match {
-      case Success(resyToken) =>
         logger.info("Headshot!")
         logger.info("(҂‾ ▵‾)︻デ═一 (× _ ×#")
         logger.info("Successfully sniped reservation")
         logger.info(s"Resy token is $resyToken")
-        Success(resyToken)
-      case _ =>
+        resyToken
+      }.recoverWith { case e =>
         logger.info("Missed the shot!")
         logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
-        logger.info(resNoLongerAvailMsg)
-        Failure(new RuntimeException(resNoLongerAvailMsg))
-    }
-  }
-
-  @tailrec
-  private[this] def retryFindReservations(
-    date: String,
-    partySize: Int,
-    venueId: Int,
-    resTimeTypes: Seq[ReservationTimeType],
-    millisToRetry: Long,
-    dateTimeStart: Long
-  ): Try[String] = {
-    val reservationTimesResp: Try[ReservationMap] = Try {
-      val response = Await.result(
-        awaitable = resyApi.getReservations(date, partySize, venueId),
-        atMost    = 5 seconds
-      )
-
-      logger.debug(s"URL Response: $response")
-
-      // Searching this JSON list structure...
-      // {"results": {"venues": [{"slots": [{...}, {...}]}]}}
-      buildReservationMap(
-        (Json.parse(response) \ "results" \ "venues" \ 0 \ "slots").get
-          .as[JsArray]
-          .value
-          .toSeq
-      )
-    }
-
-    reservationTimesResp match {
-      case Success(reservationMap) if reservationMap.nonEmpty =>
-        findReservationTime(reservationMap, resTimeTypes)
-      case _ if millisToRetry > DateTime.now.getMillis - dateTimeStart =>
-        retryFindReservations(date, partySize, venueId, resTimeTypes, millisToRetry, dateTimeStart)
-      case _ =>
-        logger.info("Missed the shot!")
-        logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
-        logger.info(noAvailableResMsg)
-        Failure(new RuntimeException(noAvailableResMsg))
-    }
-  }
-
-  @tailrec
-  private[this] def findReservationTime(
-    reservationMap: ReservationMap,
-    resTimeTypes: Seq[ReservationTimeType]
-  ): Try[String] = {
-    val results = reservationMap.get(resTimeTypes.head.reservationTime).flatMap { tableTypes =>
-      resTimeTypes.head.tableType match {
-        case Some(tableType) if tableType.nonEmpty => tableTypes.get(tableType.toLowerCase)
-        case _                                     => Some(tableTypes.head._2)
+        logger.info(s"$resNoLongerAvailMsg: ${e.getMessage}")
+        Future.failed(new RuntimeException(resNoLongerAvailMsg))
       }
     }
-
-    results match {
-      case Some(configId) =>
-        logger.info(s"Config Id: $configId")
-        Success(configId)
-      case None if resTimeTypes.tail.nonEmpty =>
-        findReservationTime(reservationMap, resTimeTypes.tail)
-      case _ =>
-        logger.info("Missed the shot!")
-        logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
-        logger.info(cantFindResMsg)
-        Failure(new RuntimeException(cantFindResMsg))
-    }
   }
 
-  private[this] def buildReservationMap(reservationTimes: Seq[JsValue]): ReservationMap = {
+  private def findReservationTime(
+    reservationMap: ReservationMap,
+    resTimeTypes: Seq[ReservationTimeType]
+  ): Either[String, String] = {
+    resTimeTypes.view
+      .map { resTimeType =>
+        reservationMap.get(resTimeType.reservationTime).flatMap { tableTypes =>
+          resTimeType.tableType match {
+            case Some(tableType) if tableType.nonEmpty => tableTypes.get(tableType.toLowerCase)
+            case _                                     => Some(tableTypes.head._2)
+          }
+        }
+      }
+      .collectFirst { case Some(configId) => configId }
+      .toRight(cantFindResMsg)
+  }
+
+  private def buildReservationMap(reservationTimes: Seq[JsValue]): ReservationMap = {
     // Build map from these JSON objects...
     // {"config": {"type":"TABLE_TYPE", "token": "CONFIG_ID"},
     // "date": {"start": "2099-01-30 17:00:00"}}
-    reservationTimes
-      .foldLeft(Map.empty[String, TableTypeMap]) { case (reservationMap, reservation) =>
-        val time =
-          (reservation \ "date" \ "start").get.toString.dropWhile(_ != ' ').drop(1).dropRight(1)
-        val config    = reservation \ "config"
-        val tableType = (config \ "type").get.toString.toLowerCase.drop(1).dropRight(1)
-        val configId  = (config \ "token").get.toString.drop(1).dropRight(1)
+    reservationTimes.foldLeft(Map.empty[String, TableTypeMap]) { case (reservationMap, reservation) =>
+      try {
+        val time = (reservation \ "date" \ "start")
+          .asOpt[String]
+          .map(_.dropWhile(_ != ' ').drop(1))
+          .getOrElse("")
 
-        if (!reservationMap.contains(time))
+        val config    = reservation \ "config"
+        val tableType = (config \ "type").asOpt[String].map(_.toLowerCase).getOrElse("")
+        val configId  = (config \ "token").asOpt[String].getOrElse("")
+
+        if (time.isEmpty || configId.isEmpty) {
+          reservationMap
+        } else if (!reservationMap.contains(time)) {
           reservationMap.updated(time, Map(tableType -> configId))
-        else
+        } else {
           reservationMap.updated(time, reservationMap(time).updated(tableType, configId))
+        }
+      } catch {
+        case _: Exception => reservationMap
       }
+    }
   }
 }
 
