@@ -48,7 +48,8 @@ object ResyBookingBot extends Logging {
       if (todaysSnipeTime.getMillis > dateTimeNow.getMillis) todaysSnipeTime
       else todaysSnipeTime.plusDays(1)
 
-    val millisUntilSnipe = nextSnipeTime.getMillis - DateTime.now.getMillis - 2000
+    // Fire exactly at snipe time (no early offset - that wastes rate limit budget)
+    val millisUntilSnipe = nextSnipeTime.getMillis - DateTime.now.getMillis
     val hoursRemaining   = millisUntilSnipe / 1000 / 60 / 60
     val minutesRemaining = millisUntilSnipe / 1000 / 60 - hoursRemaining * 60
     val secondsRemaining =
@@ -78,17 +79,27 @@ object ResyBookingBot extends Logging {
     }
 
     system.scheduler.scheduleOnce(millisUntilSnipe millis) {
-      logger.info(s"SNIPE TIME! Firing ${restaurants.size} booking attempts in parallel...")
+      logger.info(s"SNIPE TIME! Firing ${restaurants.size} booking attempts (staggered by 150ms)...")
 
-      // Run all restaurant bookings in parallel - each workflow is now fully async
+      // Stagger restaurant attempts to avoid rate limiting
+      // Each restaurant starts 150ms after the previous one
       val bookingFutures: Seq[Future[(ReservationDetails, String)]] =
-        restaurants.map { resDetails =>
+        restaurants.zipWithIndex.map { case (resDetails, index) =>
           val name     = resDetails.name.getOrElse(s"Venue ${resDetails.venueId}")
           val workflow = new ResyBookingWorkflow(resyClient, resDetails, settings.dryRun)
+          val staggerDelay = index * 150 // 0ms, 150ms, 300ms, etc.
 
-          logger.info(s"[$name] Starting booking attempt...")
+          // Use akka scheduler for staggered start
+          val startPromise = Promise[String]()
+          system.scheduler.scheduleOnce(staggerDelay millis) {
+            logger.info(s"[$name] Starting booking attempt...")
+            workflow.run().onComplete {
+              case Success(token) => startPromise.success(token)
+              case Failure(ex)    => startPromise.failure(ex)
+            }
+          }
 
-          workflow.run().transform {
+          startPromise.future.transform {
             case Success(token) =>
               logger.info(s"[$name] SUCCESS! Reservation confirmed with token: $token")
               Success((resDetails, token))

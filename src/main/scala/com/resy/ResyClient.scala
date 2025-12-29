@@ -4,7 +4,7 @@ import org.apache.logging.log4j.scala.Logging
 import org.joda.time.DateTime
 import play.api.libs.json.{JsArray, JsValue, Json}
 
-import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.{ExecutionContext, Future, blocking}
 import scala.concurrent.duration._
 import scala.language.postfixOps
 
@@ -14,6 +14,26 @@ class ResyClient(resyApi: ResyApi)(implicit ec: ExecutionContext) extends Loggin
   private type TableTypeMap   = Map[String, String]
 
   import ResyClientErrorMessages._
+
+  /** Delay helper that returns a Future that completes after the specified delay */
+  private def delay(millis: Long): Future[Unit] = {
+    Future {
+      blocking {
+        Thread.sleep(millis)
+      }
+    }
+  }
+
+  /** Calculate backoff delay based on attempt number and error type */
+  private def calculateBackoff(attemptNumber: Int, isRateLimited: Boolean): Long = {
+    if (isRateLimited) {
+      // For 429 errors: longer backoff (500ms, 1000ms, 2000ms, capped at 3000ms)
+      math.min(500L * math.pow(2, attemptNumber - 1).toLong, 3000L)
+    } else {
+      // For other retries: shorter backoff (200ms, 400ms, 800ms, capped at 1500ms)
+      math.min(200L * math.pow(2, attemptNumber - 1).toLong, 1500L)
+    }
+  }
 
   /** Tries to find a reservation based on the priority list of requested reservations times. Due to
     * race condition of when the bot runs and when the times become available, retry may be
@@ -41,7 +61,7 @@ class ResyClient(resyApi: ResyApi)(implicit ec: ExecutionContext) extends Loggin
   ): Future[String] = {
     val deadline = DateTime.now.getMillis + millisToRetry
 
-    def attempt(): Future[String] = {
+    def attempt(attemptNumber: Int = 1): Future[String] = {
       resyApi.getReservations(date, partySize, venueId).flatMap { response =>
         logger.debug(s"URL Response: $response")
 
@@ -50,8 +70,9 @@ class ResyClient(resyApi: ResyApi)(implicit ec: ExecutionContext) extends Loggin
             logger.info(s"Config Id: $configId")
             Future.successful(configId)
           case Left(error) if DateTime.now.getMillis < deadline =>
-            logger.debug(s"Retrying find: $error")
-            attempt() // retry immediately
+            val backoff = calculateBackoff(attemptNumber, isRateLimited = false)
+            logger.debug(s"Retrying find in ${backoff}ms: $error")
+            delay(backoff).flatMap(_ => attempt(attemptNumber + 1))
           case Left(error) =>
             logger.info("Missed the shot!")
             logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
@@ -59,9 +80,15 @@ class ResyClient(resyApi: ResyApi)(implicit ec: ExecutionContext) extends Loggin
             Future.failed(new RuntimeException(error))
         }
       }.recoverWith {
+        case e if e.getMessage.contains("429") && DateTime.now.getMillis < deadline =>
+          // Rate limited - use longer backoff
+          val backoff = calculateBackoff(attemptNumber, isRateLimited = true)
+          logger.warn(s"Rate limited (429), backing off for ${backoff}ms...")
+          delay(backoff).flatMap(_ => attempt(attemptNumber + 1))
         case e if DateTime.now.getMillis < deadline =>
-          logger.debug(s"Retrying after error: ${e.getMessage}")
-          attempt()
+          val backoff = calculateBackoff(attemptNumber, isRateLimited = false)
+          logger.debug(s"Retrying after error in ${backoff}ms: ${e.getMessage}")
+          delay(backoff).flatMap(_ => attempt(attemptNumber + 1))
         case e =>
           logger.info("Missed the shot!")
           logger.info("""┻━┻ ︵ \(°□°)/ ︵ ┻━┻""")
